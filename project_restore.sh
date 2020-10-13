@@ -46,8 +46,6 @@ ERROR_JSON=database_migration_errors.json
 MODULES_JSON=database_migration_modules.json
 ODOO_MIGRATED_DB_URL="https://upgrade.odoo.com/database/eu1/"
 ODOO_POSTFIX_URL="/upgraded/archive"
-ODOO_IP=localhost
-ODOO_PORT=8069
 GPG_IDENTITY=3E84782B5BC3B642
 
 ################################################################################
@@ -109,13 +107,6 @@ function log() {
 ################################################################################
 # Docker hooks
 ################################################################################
-function docker_post_build() {
-  for file in $(find . -name "Dockerfile")
-  do
-      sed -i "/^### DO NOT PUSH/,/^### END DO NOT PUSH/d" $file
-      git add $file
-  done
-}
 
 function docker_pre_build() {
   readonly repo=$(git rev-parse --show-toplevel)
@@ -144,6 +135,13 @@ function docker_pre_build() {
       fi
   done
 }
+function docker_post_build() {
+  for file in $(find . -name "Dockerfile")
+  do
+      sed -i "/^### DO NOT PUSH/,/^### END DO NOT PUSH/d" $file
+      git add $file
+  done
+}
 
 ################################################################################
 # Functional methods
@@ -151,7 +149,7 @@ function docker_pre_build() {
 
 function yaml() {
   pip install pyaml &>/dev/null
-  eval "$2=$(python -c "import yaml;print(yaml.safe_load(open('$1'))['$2'])")"
+  eval "$2=$(python -c "import yaml;value = yaml.safe_load(open('$1'))['$2'];print(value if value != 'None' else '')")"
 }
 
 function db_name_user_input() {
@@ -251,10 +249,10 @@ function restore_database() {
 
 function configure_project() {
   image=$(docker images -q "$PROJECT_NAME"_odoo:latest 2> /dev/null)
-  if [[ $FORCE_BUILD == 1 ]] || [[ -z $image ]]; then
+  if [[ -z $image ]] || [[ $FORCE_BUILD == 1 ]]; then
     log "Configure project..."
-    [[ -f tasks/requirements.txt ]] && pip install -r tasks/requirements.txt
-    [[ -f odoo/dev_requirements.txt ]] && pip install -r odoo/dev_requirements.txt
+    [[ -f tasks/requirements.txt ]] && pip install -r tasks/requirements.txt &>/dev/null
+    [[ -f odoo/dev_requirements.txt ]] && pip install -r odoo/dev_requirements.txt &>/dev/null
     invoke submodule.init |& tee -a $LOG_FILE
     invoke submodule.update |& tee -a $LOG_FILE
     docker_pre_build
@@ -280,7 +278,7 @@ function restore_db_container() {
   DB_CONTAINER_PORT=$(docker-compose ps | grep "$DB_CONTAINER_NAME" | awk '{print $7}' | cut -d'-' -f1 | cut -d':' -f2)
 }
 
-function prepare() {
+function prepare_folders() {
   rm -Rf $LOG_FILE $ERROR_JSON $MODULES_JSON &>/dev/null
   log "Cache folder for this project : $DB_FOLDER" |& tee -a $LOG_FILE
   if [[ -n $ODOO_MIGRATION_IDS ]]; then
@@ -292,61 +290,41 @@ function prepare() {
 
 function load_config() {
 
-  [[ ! -d $DB_FOLDER ]] && mkdir -p $DB_FOLDER
   [[ ! -f $LOG_FILE ]] && touch $LOG_FILE
 
   if [[ -f $DB_FOLDER/$CONFIG_FILE ]]; then
     pip install pyaml &>/dev/null
     yaml "$DB_FOLDER/$CONFIG_FILE" "AWS_BUCKET_NAME"
-    yaml "$DB_FOLDER/$CONFIG_FILE" "PG_DB_TEMPLATE"
-    yaml "$DB_FOLDER/$CONFIG_FILE" "PG_DB_SAMPLE"
     yaml "$DB_FOLDER/$CONFIG_FILE" "LOG_FILE"
     yaml "$DB_FOLDER/$CONFIG_FILE" "MIGRATION_LOG_FILE"
     yaml "$DB_FOLDER/$CONFIG_FILE" "ERROR_JSON"
     yaml "$DB_FOLDER/$CONFIG_FILE" "MODULES_JSON"
-    yaml "$DB_FOLDER/$CONFIG_FILE" "ODOO_MIGRATED_DB_URL"
-    yaml "$DB_FOLDER/$CONFIG_FILE" "ODOO_POSTFIX_URL"
-    yaml "$DB_FOLDER/$CONFIG_FILE" "ODOO_IP"
-    yaml "$DB_FOLDER/$CONFIG_FILE" "ODOO_PORT"
     yaml "$DB_FOLDER/$CONFIG_FILE" "GPG_IDENTITY"
     yaml "$DB_FOLDER/$CONFIG_FILE" "PG_PROD_DBNAME"
     yaml "$DB_FOLDER/$CONFIG_FILE" "CLEAN_AFTER_EXIT"
-    yaml "$DB_FOLDER/$CONFIG_FILE" "RESTORE_DATABASE"
-  fi
-  [[ $CLEAN_AFTER_EXIT == 1 ]] && log "/!\ clean after exit option activated" |& tee -a $LOG_FILE
-  if [[ -z $PG_PROD_DBNAME ]]; then
-    db_name_user_input
-  else
-    log "/!\ database '$PG_PROD_DBNAME' selected" |& tee -a $LOG_FILE
   fi
 }
 
 function save_config() {
-    rm "$DB_FOLDER/$CONFIG_FILE"
+    rm "$DB_FOLDER/$CONFIG_FILE" &>/dev/null
     cat << EOF >> "$DB_FOLDER/$CONFIG_FILE"
 AWS_BUCKET_NAME: $AWS_BUCKET_NAME
-PG_DB_TEMPLATE: $PG_DB_TEMPLATE
-PG_DB_SAMPLE: $PG_DB_SAMPLE
 LOG_FILE: $LOG_FILE
 MIGRATION_LOG_FILE: $MIGRATION_LOG_FILE
 ERROR_JSON: $ERROR_JSON
 MODULES_JSON: $MODULES_JSON
-ODOO_MIGRATED_DB_URL: $ODOO_MIGRATED_DB_URL
-ODOO_POSTFIX_URL: $ODOO_POSTFIX_URL
-ODOO_IP: $ODOO_IP
-ODOO_PORT: $ODOO_PORT
 GPG_IDENTITY: $GPG_IDENTITY
 PG_PROD_DBNAME: $PG_PROD_DBNAME
 CLEAN_AFTER_EXIT: $CLEAN_AFTER_EXIT
-RESTORE_DATABASE: $RESTORE_DATABASE
 EOF
+  log "Saved configuration : \n$(cat "$DB_FOLDER/$CONFIG_FILE")"
 }
 
 ################################################################################
 # Arg parser
 ################################################################################
 function usage {
-    echo "usage: $0 [-m|--migrate] [-p|--purge]"
+    echo "usage: $0"
     echo "  -p|--purge                  purge local file cache and databases" \
                                         "for this project"
     echo "  -n|--no-clean               Don't clean *.pg and *.sql files at end"
@@ -357,7 +335,6 @@ function usage {
                                         "(i.e. 12345/IRHvI20ZLj'uwzFzAYAVWg==)"
     exit 1
 }
-
 
 load_config
 
@@ -395,18 +372,25 @@ while [[ "$#" -gt 0 ]]; do
   esac
   shift
 done
-save_config
-log "Actual configuration : \n$(cat "$DB_FOLDER/$CONFIG_FILE")"
 
 [[ $PURGE == 1 ]] && purge
-prepare
+[[ $CLEAN_AFTER_EXIT == 1 ]] && log "/!\ clean after exit option activated" |& tee -a $LOG_FILE
+if [[ -z $PG_PROD_DBNAME ]]; then
+  db_name_user_input
+else
+  log "/!\ database '$PG_PROD_DBNAME' selected" |& tee -a $LOG_FILE
+fi
+
+prepare_folders
 configure_project
-if [[ $RESTORE_DATABASE == 1 ]]; then
+
+if [[ $PURGE == 1 ]] || [[ $RESTORE_DATABASE == 1 ]]; then
+  restore_db_container
   if [[ $PURGE == 1 ]]; then
-    restore_db_container
     retrieve_client_database
   fi
   restore_database
 fi
+save_config
 
 exit 0
