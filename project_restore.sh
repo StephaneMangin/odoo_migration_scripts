@@ -37,8 +37,9 @@
 PROJECT_NAME=$(basename $PWD)
 CACHE_FOLDER=~/.cache/camptocamp
 AWS_BUCKET_NAME=odoo-dumps
-PG_DB_TEMPLATE=odoodb_template
-PG_DB_SAMPLE=odoodb_sample
+PG_DB=odoodb
+PG_DB_TEMPLATE=$PG_DB"_template"
+PG_DB_SAMPLE=$PG_DB"_sample"
 LOG_FILE=project_restore.log
 CONFIG_FILE=config.yaml
 MIGRATION_LOG_FILE=database_migration.log
@@ -55,8 +56,8 @@ TEMPLATE_TO_UPDATE=0 # Force database template update
 PARTIAL_TEMPLATE_RESTORE=0 # an error has occured during template restore
 PURGE=0 # force cache purge
 ODOO_MIGRATION_IDS= # values from odoo migration url
-CLEAN_AFTER_EXIT=0 # Do not remove logs and deciphered database
 DB_FOLDER="$CACHE_FOLDER/databases/$PROJECT_NAME" # variates with database from odoo
+FILESTORE_FOLDER="$DB_FOLDER/filestore" # variates with database from odoo
 FORCE_BUILD=0 # force the reconfigure and build of project and docker image
 RESTORE_DATABASE=0 # force database restore from template
 
@@ -65,21 +66,23 @@ RESTORE_DATABASE=0 # force database restore from template
 ################################################################################
 
 function clean() {
-  if [[ $CLEAN_AFTER_EXIT == 1 ]]; then
-    rm -Rf $DB_FOLDER/*.pg &>/dev/null
-    rm -Rf $DB_FOLDER/*.sql &>/dev/null
-  fi
+  rm -Rf $DB_FOLDER/*.pg
+  rm -Rf $DB_FOLDER/*.sql
   if [[ $PARTIAL_TEMPLATE_RESTORE == 1 ]]; then
-    docker-compose run --rm odoo dropdb $PG_DB_TEMPLATE &>/dev/null
+    docker-compose run --rm odoo dropdb $PG_DB_TEMPLATE
   fi
 }
 
 function purge() {
   log "Purge configuration, databases and logs..."
-  docker-compose run --rm odoo dropdb odoodb &> /dev/null
-  docker-compose run --rm odoo dropdb $PG_DB_TEMPLATE &> /dev/null
-  rm -Rf $DB_FOLDER &> /dev/null
-  rm -Rf $LOG_FILE $ERROR_JSON $MODULES_JSON &> /dev/null
+  # close all actual connections
+  docker-compose run --rm odoo psql -c "SELECT pg_terminate_backend(pg_stat_activity.pid) FROM pg_stat_activity WHERE pg_stat_activity.datname = '$PG_DB' AND pid <> pg_backend_pid()"
+  docker-compose run --rm odoo psql -c "SELECT pg_terminate_backend(pg_stat_activity.pid) FROM pg_stat_activity WHERE pg_stat_activity.datname = '$PG_DB_TEMPLATE' AND pid <> pg_backend_pid()"
+  docker-compose run --rm odoo dropdb $PG_DB
+  docker-compose run --rm odoo dropdb $PG_DB_TEMPLATE
+  rm -Rf $DB_FOLDER
+  rm -Rf $FILESTORE_FOLDER
+  rm -Rf $LOG_FILE $ERROR_JSON $MODULES_JSON
 }
 
 ################################################################################
@@ -117,6 +120,8 @@ function docker_pre_build() {
   COMMANDS_PIP="RUN echo '[global]\ntimeout = 30\ntrusted-host = 192.168.1.22\nindex-url = http://192.168.1.22:8247/simple' | tee /home/odoo/.pip/pip.conf /root/.pip/pip.conf"
   COMMANDS_END="### END DO NOT PUSH ###
   "
+  # Add dev dependencies
+  echo -e "## custom\npdbpp\ndictdiffer" > ./odoo/dev_requirements.txt
 
   for file in $(find . -name "Dockerfile")
   do
@@ -148,7 +153,7 @@ function docker_post_build() {
 ################################################################################
 
 function yaml() {
-  pip install pyaml &>/dev/null
+  pip install pyaml
   eval "$2=$(python -c "import yaml;value = yaml.safe_load(open('$1'))['$2'];print(value if value != 'None' else '')")"
 }
 
@@ -161,52 +166,66 @@ function db_name_user_input() {
   select name in "${names[@]}"; do
     [[ $name == "exit" ]] || [[ -z $name ]] && exit 0
     PG_PROD_DBNAME="$name"
-    if [[ -n $ODOO_MIGRATION_IDS ]]; then
-      PG_PROD_DBNAME="upgraded_$name"
-    fi
-    log "database '$name' selected, proceeding..." |& tee -a $LOG_FILE
     return 0
   done
 }
 
-function _get_last_db_files_from_aws() {
-  PG_DB_FILENAME=$(aws --profile odoo-dumps s3 ls s3://$AWS_BUCKET_NAME/$PG_PROD_DBNAME/ | sort -r | head -n 1 | awk '{print $4}')
-}
-
-function _get_last_db_files_from_local() {
-  current_pg_filename=$(ls $DB_FOLDER | sort -r | grep "^$PG_PROD_DBNAME.*\.gpg$" | head -n 1)
-  [[ -n $current_pg_filename ]] && [[ $current_pg_filename == $PG_DB_FILENAME ]] && log "Found a database to use : $DB_FOLDER/$PG_DB_FILENAME"
+function db_name_user_local_input() {
+  files=($(ls $DB_FOLDER | sort -r | grep "^$PG_PROD_DBNAME.*\.gpg$"))
+  if [ "${#files[@]}" -eq "1" ]; then
+    PG_DB_FILENAME="${files[0]}"
+    PG_PROD_DBNAME=$(echo "${files[0]}" | sed -e 's/\.sql.gpg//' | sed -e 's/\.pg.gpg//' | sed -E 's/-[0-9]{8}-[0-9]{6}//')
+  elif [ "${#files[@]}" -gt "1" ]; then
+    echo "--------------------------------------------------------------------------------"
+    echo " Select a local database to proceed (or exit to download a new one):"
+    echo "--------------------------------------------------------------------------------"
+    select name in "${files[@]}"; do
+      [[ $name == "exit" ]] || [[ -z $name ]] && exit 0
+      PG_DB_FILENAME="$name"
+    PG_PROD_DBNAME=$(echo "$name" | sed -e 's/\.sql.gpg//' | sed -e 's/\.pg.gpg//' | sed -E 's/-[0-9]{8}-[0-9]{6}//')
+      return 0
+    done
+  fi
 }
 
 function retrieve_client_database() {
-  [[ ! -d $DB_FOLDER ]] && mkdir -p "$DB_FOLDER"
 
-  _get_last_db_files_from_local
-  [[ -z $PG_DB_FILENAME ]] && _get_last_db_files_from_aws
+  if [[ -n $ODOO_MIGRATION_IDS ]]; then
+    PG_PROD_DBNAME="upgraded_$PG_PROD_DBNAME"
+    tmpfile=$(mktemp /tmp/odoo_migrated_database.XXXXX.zip)
+    database_to_retrieve=$ODOO_MIGRATED_DB_URL$ODOO_MIGRATION_IDS$ODOO_POSTFIX_URL
+    log "Retrieving database from Odoo : '$database_to_retrieve'"
+    wget -q --show-progress --output-document "$tmpfile" "$database_to_retrieve"
+    log "Unzipping '$tmpfile' to local cache"
+    unzip -q "$tmpfile" -d "$tmpfile.extract" |& tee -a $LOG_FILE
+    mv "$tmpfile.extract/dump.sql" "$DB_FOLDER/$PG_PROD_DBNAME.sql" &> /dev/null
+    rm -Rf $FILESTORE_FOLDER/$PG_DB
+    mv "$tmpfile.extract/filestore" "$FILESTORE_FOLDER/$PG_DB" &> /dev/null
+    sudo chmod -R 777 $FILESTORE_FOLDER
+    sudo chown -R 999:1000 $FILESTORE_FOLDER
+    PG_DB_FILENAME="$PG_PROD_DBNAME.sql.gpg"
+    gpg -e -r $GPG_IDENTITY "$DB_FOLDER/$PG_PROD_DBNAME.sql" |& tee -a $LOG_FILE
+    rm -Rf $tmpfile
+    rm -Rf "$tmpfile.extract"
 
-  if [[ ! -f $DB_FOLDER/$PG_DB_FILENAME ]]; then
-    if [[ -n $ODOO_MIGRATION_IDS ]]; then
-      tmpfile=$(mktemp /tmp/odoo_migrated_database.XXXXX.zip)
-      database_to_retrieve=$ODOO_MIGRATED_DB_URL$ODOO_MIGRATION_IDS$ODOO_POSTFIX_URL
-      log "Retrieving database from Odoo : '$database_to_retrieve'"
-      wget -q --show-progress --output-document "$tmpfile" "$database_to_retrieve"
-      if [[ ! -f $DB_FOLDER/$PG_DB_FILENAME ]]; then
-        log "Unzipping '$tmpfile' to local cache"
-        unzip -q "$tmpfile" -d "$DB_FOLDER" |& tee -a $LOG_FILE
-        mv "$DB_FOLDER/dump.sql" "$DB_FOLDER/$PG_PROD_DBNAME.sql" &> /dev/null
-        rm "$DB_FOLDER/$PG_DB_FILENAME"  &>/dev/null
-        PG_DB_FILENAME="$PG_PROD_DBNAME.sql.gpg"
-        gpg -e -r $GPG_IDENTITY "$DB_FOLDER/$PG_PROD_DBNAME.sql" |& tee -a $LOG_FILE
-      fi
-    else
-      aws_url="s3://odoo-dumps/$PG_PROD_DBNAME/$PG_DB_FILENAME"
-      log "Retrieve database from AWS : $aws_url"
-      aws --profile=odoo-dumps s3 cp $aws_url "$DB_FOLDER" |& tee -a $LOG_FILE
-    fi
+    TEMPLATE_TO_UPDATE=1
+
+  elif [[ ! -f $DB_FOLDER/$PG_DB_FILENAME ]]; then
+    databases=$(aws --profile=odoo-dumps s3 ls s3://odoo-dumps/$PG_PROD_DBNAME/ | sort -r | awk '{print $4}')
+    databases=(exit $databases)
+    select database in "${databases[@]}"; do
+      [[ $database == "exit" ]] || [[ -z $database ]] && exit 0
+      PG_DB_FILENAME="$database"
+      break
+    done
+    aws_url="s3://odoo-dumps/$PG_PROD_DBNAME/$PG_DB_FILENAME"
+    log "Retrieve database from AWS : $aws_url"
+    aws --profile=odoo-dumps s3 cp $aws_url "$DB_FOLDER" |& tee -a $LOG_FILE
     TEMPLATE_TO_UPDATE=1
   fi
+  PG_DB_FILENAME=$(ls $DB_FOLDER | sort -r | grep ^$PG_PROD_DBNAME.*$ | head -n 1)
   tmp_pg_filename=$(echo "$PG_DB_FILENAME" | sed -e 's/\.gpg//')
-  if [[ ! -f $DB_FOLDER/$tmp_pg_filename ]]; then
+  if [[ $TEMPLATE_TO_UPDATE == 1 ]] && [[ ! -f $DB_FOLDER/$tmp_pg_filename ]]; then
     log "Deciphering database"
     gpg "$DB_FOLDER/$PG_DB_FILENAME" |& tee -a $LOG_FILE |& tee -a $LOG_FILE
   fi
@@ -214,10 +233,18 @@ function retrieve_client_database() {
 }
 
 function restore_database() {
-  [[ $TEMPLATE_TO_UPDATE == 1 ]] && log "Client database updated. Forcing template update."
+
+  if [ -d $FILESTORE_FOLDER/$PG_DB ]; then
+    log "Restoring the filestore..."
+    docker-compose up -d odoo
+    ODOO_CONTAINER_NAME=$(docker-compose ps | grep "odoo_odoo_1" | awk '{print $1}')
+    docker cp -a $FILESTORE_FOLDER $ODOO_CONTAINER_NAME:/data/odoo
+  fi
+
   if [[ $TEMPLATE_TO_UPDATE == 1 ]] || [[ $(docker exec -it $DB_CONTAINER_NAME psql -U odoo -lqt | grep -c $PG_DB_TEMPLATE) != 1 ]]; then
-    docker-compose run --rm odoo dropdb $PG_DB_TEMPLATE &>/dev/null
-    docker-compose run --rm odoo createdb $PG_DB_TEMPLATE &>/dev/null
+    docker-compose run --rm odoo psql -c "SELECT pg_terminate_backend(pg_stat_activity.pid) FROM pg_stat_activity WHERE pg_stat_activity.datname = '$PG_DB_TEMPLATE' AND pid <> pg_backend_pid()"
+    docker-compose run --rm odoo dropdb $PG_DB_TEMPLATE
+    docker-compose run --rm odoo createdb $PG_DB_TEMPLATE
     PARTIAL_TEMPLATE_RESTORE=1
     if [[ $PG_DB_FILENAME =~ \.sql$ ]]; then
       log "Restoring template from sql..."
@@ -228,21 +255,21 @@ function restore_database() {
     fi
     PARTIAL_TEMPLATE_RESTORE=0
   fi
-  if [[ $RESTORE_DATABASE == 1 ]]; then
-    log "Restoring database from template..."
-    docker-compose run --rm odoo dropdb odoodb &>/dev/null
-    docker-compose run --rm odoo createdb -T $PG_DB_TEMPLATE odoodb |& tee -a $LOG_FILE
-  fi
+
+  log "Restoring database from template..."
+  docker-compose run --rm odoo psql -c "SELECT pg_terminate_backend(pg_stat_activity.pid) FROM pg_stat_activity WHERE pg_stat_activity.datname = '$PG_DB' AND pid <> pg_backend_pid()"
+  docker-compose run --rm odoo dropdb $PG_DB
+  docker-compose run --rm odoo createdb -T $PG_DB_TEMPLATE $PG_DB
 }
 
-#function migrate() {
+#function    migrate() {
 #  log "Starting database migration... (see $MIGRATION_LOG_FILE for details)"
-#  docker-compose run --rm -e MARABUNTA_MODE=migration -e DB_NAME=odoodb odoo rundatabasemigration |& tee -a $MIGRATION_LOG_FILE
+#  docker-compose run --rm -e MARABUNTA_MODE=migration -e DB_NAME=$PG_DB odoo rundatabasemigration |& tee -a $MIGRATION_LOG_FILE
 #
 #  echo "Checking errors and modules..." |& tee -a $MIGRATION_LOG_FILE
 #  docker-compose run --rm -e DB_NAME=$PG_DB_SAMPLE -e MARABUNTA_MODE=sample odoo odoo --stop-after-init |& tee -a $MIGRATION_LOG_FILE
 #  parse_migration_log.py $MIGRATION_LOG_FILE > $ERROR_JSON
-#  invoke migrate.check-modules odoodb $PG_DB_TEMPLATE $PG_DB_SAMPLE > $MODULES_JSON
+#  invoke migrate.check-modules $PG_DB $PG_DB_TEMPLATE $PG_DB_SAMPLE > $MODULES_JSON
 #
 #  docker-compose down |& tee -a $MIGRATION_LOG_FILE
 #}
@@ -251,8 +278,8 @@ function configure_project() {
   image=$(docker images -q "$PROJECT_NAME"_odoo:latest 2> /dev/null)
   if [[ -z $image ]] || [[ $FORCE_BUILD == 1 ]]; then
     log "Configure project..."
-    [[ -f tasks/requirements.txt ]] && pip install -r tasks/requirements.txt &>/dev/null
-    [[ -f odoo/dev_requirements.txt ]] && pip install -r odoo/dev_requirements.txt &>/dev/null
+    [[ -f tasks/requirements.txt ]] && pip install -r tasks/requirements.txt
+    [[ -f odoo/dev_requirements.txt ]] && pip install -r odoo/dev_requirements.txt
     invoke submodule.init |& tee -a $LOG_FILE
     invoke submodule.update |& tee -a $LOG_FILE
     docker_pre_build
@@ -279,45 +306,11 @@ function restore_db_container() {
 }
 
 function prepare_folders() {
-  rm -Rf $LOG_FILE $ERROR_JSON $MODULES_JSON &>/dev/null
+  rm -Rf $LOG_FILE $ERROR_JSON $MODULES_JSON
   log "Cache folder for this project : $DB_FOLDER" |& tee -a $LOG_FILE
-  if [[ -n $ODOO_MIGRATION_IDS ]]; then
-    DB_FOLDER="$DB_FOLDER/migrated_from_odoo"
-    PG_PROD_DBNAME="upgraded_$PG_PROD_DBNAME"
-  fi
+
   [[ ! -d $DB_FOLDER ]] && mkdir -p "$DB_FOLDER"
-}
-
-function load_config() {
-
-  [[ ! -f $LOG_FILE ]] && touch $LOG_FILE
-
-  if [[ -f $DB_FOLDER/$CONFIG_FILE ]]; then
-    pip install pyaml &>/dev/null
-    yaml "$DB_FOLDER/$CONFIG_FILE" "AWS_BUCKET_NAME"
-    yaml "$DB_FOLDER/$CONFIG_FILE" "LOG_FILE"
-    yaml "$DB_FOLDER/$CONFIG_FILE" "MIGRATION_LOG_FILE"
-    yaml "$DB_FOLDER/$CONFIG_FILE" "ERROR_JSON"
-    yaml "$DB_FOLDER/$CONFIG_FILE" "MODULES_JSON"
-    yaml "$DB_FOLDER/$CONFIG_FILE" "GPG_IDENTITY"
-    yaml "$DB_FOLDER/$CONFIG_FILE" "PG_PROD_DBNAME"
-    yaml "$DB_FOLDER/$CONFIG_FILE" "CLEAN_AFTER_EXIT"
-  fi
-}
-
-function save_config() {
-    rm "$DB_FOLDER/$CONFIG_FILE" &>/dev/null
-    cat << EOF >> "$DB_FOLDER/$CONFIG_FILE"
-AWS_BUCKET_NAME: $AWS_BUCKET_NAME
-LOG_FILE: $LOG_FILE
-MIGRATION_LOG_FILE: $MIGRATION_LOG_FILE
-ERROR_JSON: $ERROR_JSON
-MODULES_JSON: $MODULES_JSON
-GPG_IDENTITY: $GPG_IDENTITY
-PG_PROD_DBNAME: $PG_PROD_DBNAME
-CLEAN_AFTER_EXIT: $CLEAN_AFTER_EXIT
-EOF
-  log "Saved configuration : \n$(cat "$DB_FOLDER/$CONFIG_FILE")"
+  [[ ! -d $FILESTORE_FOLDER ]] && mkdir -p "$FILESTORE_FOLDER"  # implies $DB_FOLDER
 }
 
 ################################################################################
@@ -326,23 +319,22 @@ EOF
 function usage {
     echo "usage: $0"
     echo "  -p|--purge                  purge local file cache and databases" \
-                                        "for this project"
-    echo "  -n|--no-clean               Don't clean *.pg and *.sql files at end"
+                                        "for this project (implies: -f)"
     echo "  -r|--restore-database       Force database restore from template"
-    echo "  -f|--force-build            Force the build of the docker image"
+    echo "  -b|--build            Force the build of the docker image"
     echo "  -o|--from-odoo-migration    If database comes from odoo," \
                                         "indicates the ids as follow id/key" \
                                         "(i.e. 12345/IRHvI20ZLj'uwzFzAYAVWg==)"
     exit 1
 }
 
-load_config
 
 while [[ "$#" -gt 0 ]]; do
   case $1 in
   -o|--from-odoo-migration)
     if [[ -n $2 ]] && [[ ${2:0:1} != "-" ]] && [[ $2 =~ "/" ]]; then
       ODOO_MIGRATION_IDS=$2
+      RESTORE_DATABASE=1
       shift
     else
       echo "Error: Argument for $1 is missing" >&2
@@ -354,12 +346,10 @@ while [[ "$#" -gt 0 ]]; do
     ;;
   -p|--purge)
     PURGE=1
+    FORCE_BUILD=1
     RESTORE_DATABASE=1
     ;;
-  -c|--clean)
-    CLEAN_AFTER_EXIT=1
-    ;;
-  -f|--force-build)
+  -b|--build)
     FORCE_BUILD=1
     ;;
   -h|--help)
@@ -374,23 +364,31 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 [[ $PURGE == 1 ]] && purge
-[[ $CLEAN_AFTER_EXIT == 1 ]] && log "/!\ clean after exit option activated" |& tee -a $LOG_FILE
-if [[ -z $PG_PROD_DBNAME ]]; then
-  db_name_user_input
-else
-  log "/!\ database '$PG_PROD_DBNAME' selected" |& tee -a $LOG_FILE
-fi
 
 prepare_folders
+if [[ $RESTORE_DATABASE == 1 ]]; then
+  db_name_user_local_input
+  [[ -z $PG_PROD_DBNAME ]] && db_name_user_input
+fi
+[[ -n $PG_PROD_DBNAME ]] && log "/!\ database '$PG_PROD_DBNAME' selected" |& tee -a $LOG_FILE
+
 configure_project
 
-if [[ $PURGE == 1 ]] || [[ $RESTORE_DATABASE == 1 ]]; then
-  restore_db_container
-  if [[ $PURGE == 1 ]]; then
-    retrieve_client_database
+if [[ $RESTORE_DATABASE == 1 ]]; then
+  if [[ $PURGE != 1 ]]; then
+    read -p "Do you wish to update your template [yN]? " answer
+  else
+    answer='y'
   fi
+  case ${answer:0:1} in
+      y|Y )
+          TEMPLATE_TO_UPDATE=1;
+        ;;
+  esac
+  restore_db_container
+  retrieve_client_database
   restore_database
 fi
-save_config
 
 exit 0
+
