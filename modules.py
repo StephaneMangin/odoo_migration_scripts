@@ -1,11 +1,16 @@
 #!/usr/bin/env python
-import pprint
+import json
+import logging
 
 import click
 
 from odoo_module_graph import OdooModules
 
-pp = pprint.PrettyPrinter(indent=4)
+_logger = logging.getLogger(__name__)
+
+
+def formatted_print(obj):
+    print(json.dumps(obj, sort_keys=True, indent=4, ensure_ascii=False))
 
 
 @click.group()
@@ -19,12 +24,13 @@ def cli(ctx, database):
 
 
 @cli.command(name='optimize_dependencies')
-@click.option('--restrict-path', default="./odoo/local-src", help='A specific path to search modules from')
+@click.option('--restrict-path', help='A specific path to search modules from')
 @click.pass_context
-def optimize_dependencies(ctx, restrict_path):
+def optimize_dependencies(ctx, restrict_path=None):
     database = ctx.obj['database']
     odoo_modules = OdooModules(database)
-    pp.pprint(odoo_modules.get_optimized_modules_dependencies(restrict_path))
+    modules = odoo_modules.get_optimized_modules_dependencies(restrict_path)
+    formatted_print(modules)
 
 
 @cli.command(name='module_to_update')
@@ -32,7 +38,8 @@ def optimize_dependencies(ctx, restrict_path):
 def module_to_update(ctx):
     database = ctx.obj['database']
     odoo_modules = OdooModules(database)
-    pp.pprint(odoo_modules.get_modules_to_update())
+    modules = odoo_modules.get_modules_to_update()
+    formatted_print(modules)
 
 
 @cli.command(name='module_to_remove')
@@ -40,16 +47,29 @@ def module_to_update(ctx):
 def module_to_remove(ctx):
     database = ctx.obj['database']
     odoo_modules = OdooModules(database)
-    pp.pprint(odoo_modules.get_modules_to_remove())
+    modules = odoo_modules.get_modules_to_remove()
+    formatted_print(modules)
 
 
 @cli.command(name='installed_modules')
 @click.option('--no-dependency', '-N', is_flag=True, help='Includes only modules without dependencies')
 @click.pass_context
-def installed_modules(ctx, no_dependency):
+def installed_modules(ctx, no_dependency=False):
     database = ctx.obj['database']
     odoo_modules = OdooModules(database)
-    pp.pprint(odoo_modules.get_installed_modules(only_leaves=no_dependency))
+    modules = odoo_modules.get_installed_modules(only_leaves=no_dependency)
+    formatted_print(modules)
+
+
+@cli.command(name='diff')
+@click.option('--to-database', '-t')
+@click.pass_context
+def diff(ctx, to_database):
+    database = ctx.obj['database']
+    from_modules = OdooModules(database)
+    to_modules = OdooModules(to_database)
+    diff_modules = from_modules.difference(to_modules)
+    formatted_print(diff_modules)
 
 
 if __name__ == '__main__':

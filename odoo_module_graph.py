@@ -1,12 +1,16 @@
 import ast
-import os
 import re
+import os
 from os.path import join as opj
 from subprocess import Popen, PIPE
 
-import pygraphviz
-import networkx as nx
 import csv
+
+import networkx as nx
+import pygraphviz
+
+from utils.abstract_graph import AbstractGraph
+from utils import add_node, clean_graph, remove_node, to_native, leaves, check_node
 
 MANIFEST_FILES = ["__manifest__.py", "__openerp__.py"]
 ADDONS_PATHES = [
@@ -46,16 +50,6 @@ def module_manifest(path):
         if os.path.isfile(returned_path):
             return returned_path
     return None
-
-
-def to_native(source, encoding="utf-8", falsy_empty=False):
-    if not source and falsy_empty:
-        return ""
-
-    if isinstance(source, bytes):
-        return source.decode(encoding)
-
-    return str(source)
 
 
 def load_from_docker_psql(database="odoodb"):
@@ -183,16 +177,6 @@ def update_from_manifest(
     return modules
 
 
-def leaves(graph):
-    """ Return modules not in dependency of any other module
-
-    @:parameter graph <pygraphviz.AGraph>
-    @:returns list<string>
-    """
-    edge_nodes = [e[0] for e in graph.edges()]
-    return list(filter(lambda m: m not in edge_nodes, graph.nodes()))
-
-
 class States:
 
     TO_INSTALL = "to install"
@@ -248,73 +232,42 @@ class States:
         return result
 
 
-class OdooModules:
+class OdooModules(AbstractGraph):
     """ https://pythonhosted.org/OERPLib/tutorials.html#inspect-the-metadata-of-your-server-new-in-version-0-8
 
     """
 
-    _database = None
     _exclude_states = set()
-    _exclude_modules = set()
     _exclude_test_module = True
-    _graph = None
-    _modules = {}
 
     def __init__(
             self,
             database,
-            exclude_modules=(),
+            exclude_nodes=(),
             exclude_states=(),
             include_test_module=False
     ):
         assert (
             all([s for s in exclude_states if s in States.state2color.keys()]))
-        self._database = database
+        self._name = database
 
         # Then priority to load the database
         # Then process manifest files (contains real code values to be applied)
-        self._modules = load_from_docker_psql(self._database)
-        update_from_manifest(self._modules)
+        self._nodes = load_from_docker_psql(self._name)
+        update_from_manifest(self._nodes)
 
         # Process resulting states and inconsistency
-        for module_name in self._modules.keys():
-            self._modules[module_name]["state"] = self._get_state(module_name)
+        for module_name in self._nodes.keys():
+            self._nodes[module_name]["state"] = self.get_state(module_name)
 
         # with open("modules.json", "w") as a_file:
-        #     json.dump(dict(sorted(self._modules.items())), a_file)
+        #     json.dump(dict(sorted(self._nodes.items())), a_file)
 
         self._graph = self._generate_pygraphviz(
-            exclude_modules=exclude_modules,
+            exclude_modules=exclude_nodes,
             exclude_states=exclude_states,
             include_test_module=include_test_module
         )
-
-    def _get_state(self, name):
-        """ Returns the final state of a module depending of it"s state in
-        database and manifest """
-        if name not in self._modules.keys():
-            return None
-        database_state = self._modules[name].get("database_state", False)
-        manifest_state = self._modules[name].get("manifest_state", False)
-        result = States.merge(database_state, manifest_state)
-        if not result:
-            raise Exception("Inconsistent states db:{} manifest:{}".format(
-                database_state, manifest_state
-            ))
-        return result
-
-    def _check(self, name, raise_exception=True):
-        """ Check if a module is present
-
-        @:parameter raise_exception <bool> Raises an exception if not found
-        @:raises <ModuleNotFoundError> if module is absent
-        @:returns <bool>
-        """
-        if name not in self._graph.nodes():
-            if raise_exception:
-                raise ModuleNotFoundError(name)
-            return False
-        return True
 
     #
     # Delegated methods
@@ -332,12 +285,12 @@ class OdooModules:
             states = []
         nx_digraph = nx.DiGraph(graph)
         if not names:
-            names = leaves(self._graph)
+            names = leaves(graph)
         lca = names[0]
         sorted_modules = set(sorted(names[index:]))
         if states:
             sorted_modules = filter(
-                lambda m: self._get_state(m) in states,
+                lambda m: self.get_state(m) in states,
                 sorted_modules
             )
         for next, name in enumerate(sorted_modules):
@@ -359,19 +312,19 @@ class OdooModules:
         return names
 
     def _propagate_state_to_successors(self, graph, name):
-        state = self._get_state(name)
+        state = self.get_state(name)
         for child in graph.successors(name):
             if state == States.TO_REMOVE:
-                self._modules[child]["state"] = state
+                self._nodes[child]["state"] = state
             if state == "to update":
-                self._modules[child]["state"] = state
+                self._nodes[child]["state"] = state
 
     def _check_state_from_predecessors(self, graph, name):
-        state = self._get_state(name)
+        state = self.get_state(name)
         for child in graph.predecessors(name):
             if state != States.TO_INSTALL:
                 continue
-            child_state = self._get_state(child)
+            child_state = self.get_state(child)
             if child_state not in (States.UNINSTALLABLE, States.TO_REMOVE):
                 continue
             raise Exception(
@@ -379,39 +332,6 @@ class OdooModules:
                     name, state
                 )
             )
-
-    def _add_node(self, graph, name, values):
-        state = self._get_state(name)
-        if not graph.has_node(name):
-            graph.add_node(
-                name,
-                style="filled",
-                color=States.state2color[state][1],
-                fillcolor=States.state2color[state][0],
-                group=States.state2group[state],
-            )
-        for child_name in values.get("children", []):
-            graph.add_edge(name, child_name)
-        return graph
-
-    @staticmethod
-    def _remove_node(graph, node):
-        """ Removing a node implies to remove everything related: node and edges
-            Then reconstructs all edges from predecessors to successors:
-                node(edge(n), edge(m)) implies edge(n*m)
-        """
-        if graph.has_node(node):
-            # Keep dependencies
-            predecessors = graph.predecessors(node)
-            successors = graph.successors(node)
-            # Purge node and edges
-            graph.remove_node(node)
-            for edge in graph.edges(node):
-                graph.remove_edge(edge.source, edge.target)
-            # Then reconstructs all edges
-            for (p, s) in zip(predecessors, successors):
-                graph.add_edge(p, s)
-        return graph
 
     def _generate_pygraphviz(
             self,
@@ -433,25 +353,22 @@ class OdooModules:
             splines="true"
         )
 
-        for name, values in self._modules.items():
+        for name, values in self._nodes.items():
             # Populate the graph entirely (we need all original edges and nodes)
-            self._add_node(graph, name, values)
+            state = self.get_state(name)
+            color = States.state2color[state][1]
+            fillcolor = States.state2color[state][0]
+            group = States.state2group[state]
+            add_node(graph, name, values, color, fillcolor, group)
 
         for name in graph.nodes():
             if (
                     name in exclude_modules
-                    or self._get_state(name) in exclude_states
+                    or self.get_state(name) in exclude_states
                     or (not include_test_module and name.startswith("test_"))
             ):
-                self._remove_node(graph, name)
-
-        # And clean it up from transitive edges
-        graph.tred(copy=False)
-        # Improve layout aspect ratio
-        graph.unflatten(args="-l 6 -f -c 100")
-        # Removes any cyclic dependencies
-        graph.acyclic()
-
+                remove_node(graph, name)
+        clean_graph(graph)
         # for name in graph.nodes():
         #     self._check_state_from_predecessors(graph, name)
         return graph
@@ -467,19 +384,21 @@ class OdooModules:
         nodes = set([])
         if self._exclude_states:
             for node in edges.keys():
-                state = self._get_state(node)
+                state = self.get_state(node)
                 if state not in self._exclude_states:
                     nodes.add(node)
             for subnodes in edges.values():
                 for node in subnodes:
-                    state = self._get_state(node)
+                    state = self.get_state(node)
                     if state not in self._exclude_states:
                         nodes.add(node)
         else:
             for k, v in edges.items():
                 nodes.add(k)
                 nodes.update(v)
-        return self._graph.subgraph(nodes)
+        graph = self._graph.subgraph(nodes)
+        clean_graph(graph)
+        return graph
 
     def _sub_graph_from_states(self, graph, states=None):
         """ Returns a subgraph for all module for state in `states`
@@ -490,12 +409,13 @@ class OdooModules:
         if states is None:
             states = []
         modules_to_remove = [
-            name for name in self._modules.keys()
-            if self._get_state(name) not in states
+            name for name in self._nodes.keys()
+            if self.get_state(name) not in states
         ]
         sub_graph = graph.copy()
         for name in modules_to_remove:
-            self._remove_node(sub_graph, name)
+            remove_node(sub_graph, name)
+        clean_graph(sub_graph)
         return sub_graph
 
     #
@@ -503,16 +423,16 @@ class OdooModules:
     #
 
     def __hash__(self):
-        return self._modules.__hash__()
+        return self._nodes.__hash__()
 
     def __eq__(self, other):
         if isinstance(other, OdooModules):
             return (
-                self._modules.__eq__(other._modules)
+                self._nodes.__eq__(other._nodes)
                 and self._exclude_states.__eq__(other._exclude_states)
                 and self._exclude_test_module.__eq__(other._exclude_test_module)
-                and self._exclude_modules.__eq__(other._exclude_modules)
-                and self._database.__eq__(other._database)
+                and self._exclude_nodes.__eq__(other._exclude_nodes)
+                and self._name.__eq__(other._name)
             )
         return False
 
@@ -521,6 +441,20 @@ class OdooModules:
     # DO NOT USE IN PRIVATE METHODS
     #
 
+    def get_state(self, name):
+        """ Returns the final state of a module depending of it"s state in
+        database and manifest """
+        if name not in self._nodes.keys():
+            return None
+        database_state = self._nodes[name].get("database_state", False)
+        manifest_state = self._nodes[name].get("manifest_state", False)
+        result = States.merge(database_state, manifest_state)
+        if not result:
+            raise Exception("Inconsistent states db:{} manifest:{}".format(
+                database_state, manifest_state
+            ))
+        return result
+
     def get_dependencies(self, name):
         """ Returns the dependency list of a module
 
@@ -528,7 +462,7 @@ class OdooModules:
         @:returns list<string> (A module names list)
         @:raise ModuleNotFoundError
         """
-        self._check(name)
+        check_node(self._graph, name)
         subgraph = self._create_root_subgraph(self._graph, name)
         return [node for node in subgraph.nodes()]
 
@@ -539,8 +473,8 @@ class OdooModules:
         @:returns <string> (A module state)
         @:raise ModuleNotFoundError
         """
-        self._check(name)
-        return self._modules[name]["state"]
+        check_node(self._graph, name)
+        return self._nodes[name]["state"]
 
     def modules(self):
         """ Return full modules list
@@ -564,27 +498,34 @@ class OdooModules:
         :return:
         """
         diff = {}
-        relpath = os.path.relpath(path, ".")
-        for module, values in self._modules.items():
-            has_submodule = "submodule" in values and values["submodule"]
-            if not self._check(module, raise_exception=False):
+        module_items = self._nodes.items()
+        # Doesn't keep uninstalled, uninstallable or to remove modules
+        graph = self._sub_graph_from_states(self._graph, [
+            States.TO_UPGRADE,
+            States.TO_INSTALL,
+            States.INSTALLED,
+            States.INSTALLABLE,
+        ])
+        for module, values in module_items:
+            if not check_node(graph, module, raise_exception=False):
                 continue
-            common_path = False
-            if has_submodule:
-                relsubpath = os.path.relpath(values["submodule"], ".")
-                common_path = relpath in relsubpath
-            if not common_path:
-                continue
+            # Check path only if provided
+            if path:
+                has_submodule = "submodule" in values and values["submodule"]
+                relpath = os.path.relpath(path, ".")
+                common_path = False
+                if has_submodule:
+                    relsubpath = os.path.relpath(values["submodule"], ".")
+                    common_path = relpath in relsubpath
+                if not common_path:
+                    continue
             children = [
-                m for m, v in self._modules.items()
+                m for m, v in module_items
                 if module in v["children"]
             ]
-            predecessors = self._graph.predecessors(module)
+            predecessors = graph.predecessors(module)
             if set(predecessors) != set(children):
-                diff[module] = {
-                    "actual": sorted(children),
-                    "optimized": sorted(predecessors),
-                }
+                diff[module] = sorted(predecessors)
         return dict(sorted(diff.items()))
 
     def get_modules_to_update(self):
@@ -611,10 +552,36 @@ class OdooModules:
         return sorted(lcas)
 
     def get_installed_modules(self, only_leaves=False):
-        modules = [m for m, v in self._modules.items() if v["state"] == States.INSTALLED]
+        modules = [m for m, v in self._nodes.items() if v["state"] == States.INSTALLED]
         if only_leaves:
             modules = [m for m in modules if m in self.leaves()]
         return sorted(modules)
+
+    def difference(self, odoo_modules):
+        """ Returns a dict representing differences between two Odoo modules
+
+        :param odoo_modules: <OdooModules>
+        :return:
+        """
+        old_modules = set(self.modules())
+        new_modules = set(odoo_modules.modules())
+        intersection = new_modules.intersection(old_modules)
+        old_difference = old_modules.difference(new_modules)
+        new_difference = new_modules.difference(old_modules)
+        changed_modules = {}
+        for module in intersection:
+            old_state = self.get_state(module)
+            new_state = odoo_modules.get_state(module)
+            if old_state != new_state:
+                changed_modules[module] = {
+                    "old_state": old_state,
+                    "new_state": new_state,
+                }
+        return {
+            "removed": sorted(list(old_difference - intersection)),
+            "added": sorted(list(new_difference - intersection)),
+            "changed": dict(sorted(changed_modules.items())),
+        }
 
     def save_as(self, filename="modules_dependency_graph-{}.png"):
         """ Save the module dependencies graphically
@@ -640,6 +607,6 @@ class OdooModules:
         name, extension = os.path.splitext(filename)
         if extension.replace(".", "") in allowed_extensions:
             self._graph.layout(prog="dot", args="-Nshape=box")
-            self._graph.draw(filename.format(self._database))
+            self._graph.draw(filename.format(self._name))
             return self
         raise Exception("Extension not allowed!")
